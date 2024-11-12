@@ -71,6 +71,10 @@ class HiddenMarkovModel:
 
         self.tagset = tagset
         self.vocab = vocab
+        
+        # set by forward pass and used by backward pass
+        self.alpha = None
+        self.log_Z = None
 
         # Useful constants that are referenced by the methods
         self.bos_t: Optional[int] = tagset.index(BOS_TAG)
@@ -124,16 +128,18 @@ class HiddenMarkovModel:
     def printAB(self) -> None:
         """Print the A and B matrices in a more human-readable format (tab-separated)."""
         print("Transition matrix A:")
-        col_headers = [""] + [str(self.tagset[t]) for t in range(self.A.size(1))]
+        max_row = max(len(str(self.tagset[s])) for s in range(self.A.size(0)))
+
+        col_headers = [" " * max_row]  + [str(self.tagset[t]) for t in range(self.A.size(1))]
         print("\t".join(col_headers))
         for s in range(self.A.size(0)):   # rows
-            row = [str(self.tagset[s])] + [f"{self.A[s,t]:.3f}" for t in range(self.A.size(1))]
+            row = [str(self.tagset[s]) + " " * (max_row - len(str(self.tagset[s])))] + [f"{self.A[s,t]:.3f}" for t in range(self.A.size(1))]
             print("\t".join(row))
         print("\nEmission matrix B:")        
-        col_headers = [""] + [str(self.vocab[w]) for w in range(self.B.size(1))]
+        col_headers = [" " * max_row] + [str(self.vocab[w]) for w in range(self.B.size(1))]
         print("\t".join(col_headers))
         for t in range(self.A.size(0)):   # rows
-            row = [str(self.tagset[t])] + [f"{self.B[t,w]:.3f}" for w in range(self.B.size(1))]
+            row = [str(self.tagset[t]) + " " * (max_row - len(str(self.tagset[t])))] + [f"{self.B[t,w]:.3f}" for w in range(self.B.size(1))]
             print("\t".join(row))
         print("\n")
 
@@ -162,9 +168,13 @@ class HiddenMarkovModel:
         # Update transition probabilities (self.A).  
         # Don't forget to respect the settings self.unigram and λ.
         # See the init_params() method for a discussion of self.A in the
-        # unigram case.
+        # unigram case.me
         
-        raise NotImplementedError   # you fill this in!
+        self.A_counts += λ         # smooth the counts
+        self.A = self.A_counts / self.A_counts.sum(dim=1, keepdim=True)  # normalize to prob dist
+        self.A[self.eos_t, :] = 0  # replace nan values with structural zeroes
+        self.A[:, self.bos_t] = 0
+
 
     def _zero_counts(self):
         """Set the expected counts to 0.  
@@ -221,8 +231,17 @@ class HiddenMarkovModel:
             self._zero_counts()
             for sentence in tqdm(corpus, total=len(corpus), leave=True):
                 isent = self._integerize_sentence(sentence, corpus)
-                self.E_step(isent)
-
+                
+                
+                # TODO: integrate supervised, unsupervised and semi-supervised into single function
+                
+                if None not in set(isent[i][1] for i in range(len(isent))):
+                    # SUPERVISED
+                    self.E_step_sup(isent)
+                else:
+                    # UNSUPERVISED
+                    self.E_step(isent)
+                    
             # M step: Update the parameters based on the accumulated counts.
             self.M_step(λ)
             
@@ -281,6 +300,19 @@ class HiddenMarkovModel:
         # probability of all paths (up to floating-point error).
         assert torch.isclose(log_Z_forward, log_Z_backward), f"backward log-probability {log_Z_backward} doesn't match forward log-probability {log_Z_forward}!"
 
+    def E_step_sup(self, isent: IntegerizedSentence) -> None:
+        """Finds counts for given sentences and to estimate A and B"""
+        for j in range(1, len(isent)):
+            w_j = isent[j][0]
+            t_j = isent[j][1]
+            t_j_prev = isent[j-1][1]
+            self.A_counts[t_j_prev, t_j] += 1
+            if w_j != self.bos_t:
+                self.B_counts[t_j, w_j] += 1
+             
+        
+
+
     @typechecked
     def forward_pass(self, isent: IntegerizedSentence) -> TorchScalar:
         """Run the forward algorithm from the handout on a tagged, untagged, 
@@ -297,15 +329,31 @@ class HiddenMarkovModel:
         # But to better match the notation in the handout, we'll instead
         # preallocate a list alpha of length n+2 so that we can assign 
         # directly to each alpha[j] in turn.
+        n = len(isent)
         alpha = [torch.empty(self.k) for _ in isent]    
         alpha[0] = self.eye[self.bos_t]  # vector that is one-hot at BOS_TAG
+        
+        for j in range(1, n):
+            
+            # current word
+            w_j = isent[j][0]
+            
+            # perform elem-wise multiply for prev alpha_k along A and sum along 1 dimension to complete matmul
+            tmp = torch.sum((alpha[j-1].view(self.k, 1)) * self.A, dim=0)
+
+            # perform elem-wise multiply with emission probs
+            alpha[j] = tmp * (self.B[:,w_j] if w_j != self.vocab.index(EOS_WORD) else 1)
 
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
             # English tagging data. See section C in the reading handout.
+        Z = alpha[n-1][self.tagset.index(EOS_TAG)]
+        log_Z = torch.log(Z)
         
-        raise NotImplementedError   # you fill this in!
-
+        # keep track of attributes to be used in backward pass
+        self.alpha = alpha
+        self.Z = Z
+        
         return log_Z
 
     @typechecked
@@ -320,10 +368,30 @@ class HiddenMarkovModel:
         pass."""
 
         # Pre-allocate beta just as we pre-allocated alpha.
+        n = len(isent)
         beta = [torch.empty(self.k) for _ in isent]
         beta[-1] = self.eye[self.eos_t]  # vector that is one-hot at EOS_TAG
-       
-        raise NotImplementedError   # you fill this in!
+        
+        # UNSUPERVISED
+        for j in range(n-1, 0, -1):
+            
+            # current word
+            w_j = isent[j][0]
+            
+            for t_j in self.tagset:
+                # update emission counts
+                t_j = self.tagset.index(t_j)
+                if w_j != self.vocab.index(EOS_WORD): self.B_counts[t_j, w_j] += (self.alpha[j][t_j] * beta[j][t_j]) / self.Z 
+                for prev_tag in self.tagset:
+                    prev_t_j = self.tagset.index(prev_tag)
+                    # update transition counts
+                    cur_prob = self.A[prev_t_j, t_j] * (self.B[t_j, w_j] if w_j != self.vocab.index(EOS_WORD) else 1)
+                    self.A_counts[prev_t_j, t_j] += (self.alpha[j-1][prev_t_j] * cur_prob * beta[j][t_j]) / self.Z
+                    beta[j-1][prev_t_j] += cur_prob * beta[j][t_j]
+
+
+        Z_backward = beta[0][self.tagset.index(BOS_TAG)]
+        log_Z_backward = torch.log(Z_backward)
 
         return log_Z_backward
 
@@ -346,15 +414,86 @@ class HiddenMarkovModel:
         isent = self._integerize_sentence(sentence, corpus)
 
         # See comments in log_forward on preallocation of alpha.
+        n = len(isent) # number of words including BOS and EOS
         alpha        = [torch.empty(self.k)                  for _ in isent]  
         backpointers = [torch.empty(self.k, dtype=torch.int) for _ in isent]
-        tags: List[int]    # you'll put your integerized tagging here
+        tags: List[int] = [None for _ in range(n)]   # initialize empty list of tags of size n
 
-        raise NotImplementedError   # you fill this in!
 
+        
+        # initialize "start" node of graph
+        alpha[0][corpus.tagset.index(BOS_TAG)] = 1
+        
+        # print(isent)
+        # print([tag for tag in corpus.tagset])
+        
+        # iterate over words in sentence
+        for j in range(1, n):
+            
+            # current word
+            w_j = isent[j][0]
+            
+            # perform elem-wise multiply for each prev alpha_k along A
+            tmp = (alpha[j-1].view(self.k, 1)) * self.A
+            
+            # take maximum transition prob along each of the possible prev tags
+            max_probs, max_ptrs = torch.max(tmp, dim=0)
+            
+            # update current alpha to transition probs * emission probs
+            alpha[j] = max_probs * (self.B[:,w_j] if w_j != self.vocab.index(EOS_WORD) else 1)
+
+            # set current backpointers to maximum found
+            backpointers[j] = max_ptrs
+            
+        
+            
+            # NON-VECTORIZED
+            # for tag in corpus.tagset: # iterate over possible tags of current word
+            #     for prev_tag in corpus.tagset: # iterate over possible tags of previous word
+                    
+
+                    
+            #         # integerize current and previous possible tags
+            #         t_j = corpus.integerize_tag(tag)
+            #         prev_t_j = corpus.integerize_tag(prev_tag)
+                    
+            #         # find current word
+            #         w_j = isent[j][0]
+                    
+            #         # print(t_j, j, prev_t_j, j-1, w_j, corpus.vocab.index(EOS_WORD))
+
+            #         # find p from transition and emission probs
+            #         transition_prob = self.A[prev_t_j, t_j] 
+                    
+            #         # handle case for EOS and BOS
+            #         if w_j == corpus.vocab.index(EOS_WORD):
+            #             emission_prob = 1 if t_j == corpus.tagset.index(EOS_TAG) else 0
+            #         else: 
+            #             emission_prob = self.B[t_j, w_j] 
+                        
+            #         cur_prob = transition_prob * emission_prob
+                    
+                    
+            #         # update alpha and backpointer if we've found better path
+            #         if alpha[j][t_j] < alpha[j-1][prev_t_j]*cur_prob:
+            #             alpha[j][t_j] = alpha[j-1][prev_t_j]*cur_prob
+            #             backpointers[j][t_j] = prev_t_j
+                        
+        # follow backpointers to rebuild best tag sequence
+        tags[n-1] = corpus.integerize_tag(EOS_TAG)
+        for j in range(n-1, 0, -1):
+            tags[j-1] = backpointers[j][tags[j]]
+        
+        
+        
+        # print(tags)
+        # print("tags: ", [corpus.tagset[i] for i in tags])
+        # print(len(tags))
+        # print(len(isent))
+        
         # Make a new tagged sentence with the old words and the chosen tags
         # (using self.tagset to deintegerize the chosen tags).
-        return Sentence([(word, self.tagset[tags[j]]) for j, (word, tag) in enumerate(sentence)])
+        return Sentence([(word, self.tagset[tags[balls]]) for balls, (word, tag) in enumerate(sentence)])
 
     def save(self, model_path: Path) -> None:
         logger.info(f"Saving model to {model_path}")
