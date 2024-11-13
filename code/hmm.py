@@ -307,7 +307,7 @@ class HiddenMarkovModel:
             t_j = isent[j][1]
             t_j_prev = isent[j-1][1]
             self.A_counts[t_j_prev, t_j] += 1
-            if w_j != self.bos_t:
+            if t_j != self.eos_t:
                 self.B_counts[t_j, w_j] += 1
              
         
