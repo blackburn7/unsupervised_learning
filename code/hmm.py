@@ -307,7 +307,7 @@ class HiddenMarkovModel:
             t_j = isent[j][1]
             t_j_prev = isent[j-1][1]
             self.A_counts[t_j_prev, t_j] += 1
-            if w_j != self.bos_t:
+            if t_j != self.eos_t:
                 self.B_counts[t_j, w_j] += 1
              
         
@@ -333,28 +333,35 @@ class HiddenMarkovModel:
         alpha = [torch.empty(self.k) for _ in isent]    
         alpha[0] = self.eye[self.bos_t]  # vector that is one-hot at BOS_TAG
         
+        
+        lA = torch.log(self.A)
+        lB = torch.log(self.B)
+        
         for j in range(1, n):
             
             # current word
             w_j = isent[j][0]
             
-            # perform elem-wise multiply for prev alpha_k along A and sum along 1 dimension to complete matmul
-            tmp = torch.sum((alpha[j-1].view(self.k, 1)) * self.A, dim=0)
+            # perform elem-wise add for prev log alpha_k along log A and sum exp along 1 dimension to complete matmul
+            ltmp = torch.logsumexp((torch.log(alpha[j-1].view(self.k, 1))) + lA, dim=0)
 
-            # perform elem-wise multiply with emission probs
-            alpha[j] = tmp * (self.B[:,w_j] if w_j != self.vocab.index(EOS_WORD) else 1)
+            # perform elem-wise add with emission probs in log space
+            alpha[j] = torch.exp(ltmp + (lB[:,w_j] if w_j != self.vocab.index(EOS_WORD) else 0))
 
             # Note: once you have this working on the ice cream data, you may
             # have to modify this design slightly to avoid underflow on the
             # English tagging data. See section C in the reading handout.
-        Z = alpha[n-1][self.tagset.index(EOS_TAG)]
-        log_Z = torch.log(Z)
+        
+        # Z = alpha[n-1][self.tagset.index(EOS_TAG)]
+        # log_Z = torch.log(Z)
+        
         
         # keep track of attributes to be used in backward pass
-        self.alpha = alpha
-        self.Z = Z
+        self.lalpha = [torch.log(row) for row in alpha]
+        self.log_Z = self.lalpha[n-1][self.tagset.index(EOS_TAG)]
+
         
-        return log_Z
+        return self.log_Z
 
     @typechecked
     def backward_pass(self, isent: IntegerizedSentence, mult: float = 1) -> TorchScalar:
@@ -372,6 +379,10 @@ class HiddenMarkovModel:
         beta = [torch.empty(self.k) for _ in isent]
         beta[-1] = self.eye[self.eos_t]  # vector that is one-hot at EOS_TAG
         
+        lalpha = self.lalpha
+        lA = torch.log(self.A)
+        lB = torch.log(self.B)
+        
         # UNSUPERVISED
         for j in range(n-1, 0, -1):
             
@@ -381,17 +392,19 @@ class HiddenMarkovModel:
             for t_j in self.tagset:
                 # update emission counts
                 t_j = self.tagset.index(t_j)
-                if w_j != self.vocab.index(EOS_WORD): self.B_counts[t_j, w_j] += (self.alpha[j][t_j] * beta[j][t_j]) / self.Z 
+                if w_j != self.vocab.index(EOS_WORD): 
+                    self.B_counts[t_j, w_j] += torch.exp((lalpha[j][t_j] + torch.log(beta[j][t_j])) - self.log_Z) 
                 for prev_tag in self.tagset:
                     prev_t_j = self.tagset.index(prev_tag)
                     # update transition counts
-                    cur_prob = self.A[prev_t_j, t_j] * (self.B[t_j, w_j] if w_j != self.vocab.index(EOS_WORD) else 1)
-                    self.A_counts[prev_t_j, t_j] += (self.alpha[j-1][prev_t_j] * cur_prob * beta[j][t_j]) / self.Z
-                    beta[j-1][prev_t_j] += cur_prob * beta[j][t_j]
+                    
+                    
+                    lcur_prob = lA[prev_t_j, t_j] + (lB[t_j, w_j] if w_j != self.vocab.index(EOS_WORD) else 0)
+                    self.A_counts[prev_t_j, t_j] += torch.exp((lalpha[j-1][prev_t_j] + lcur_prob + torch.log(beta[j][t_j])) - self.log_Z)
+                    beta[j-1][prev_t_j] += torch.exp(lcur_prob + torch.log(beta[j][t_j]))
 
 
-        Z_backward = beta[0][self.tagset.index(BOS_TAG)]
-        log_Z_backward = torch.log(Z_backward)
+        log_Z_backward = torch.log(beta[0][self.tagset.index(BOS_TAG)])
 
         return log_Z_backward
 
